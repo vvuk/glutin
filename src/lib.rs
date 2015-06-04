@@ -47,7 +47,7 @@ extern crate cocoa;
 #[cfg(target_os = "macos")]
 extern crate core_foundation;
 #[cfg(target_os = "macos")]
-extern crate glutin_core_graphics as core_graphics;
+extern crate core_graphics;
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 extern crate x11;
 #[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature="headless"))]
