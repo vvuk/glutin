@@ -1,13 +1,13 @@
-#![feature(old_io,old_path,os)]
 extern crate gl_generator;
 extern crate khronos_api;
 
 use std::env;
-use std::old_io::File;
+use std::fs::File;
+use std::path::PathBuf;
 
 fn main() {
     let target = env::var("TARGET").unwrap();
-    let dest = Path::new(env::var("OUT_DIR").unwrap());
+    let dest = PathBuf::from(&env::var("OUT_DIR").unwrap());
 
     if target.contains("windows") {
         let mut file = File::create(&dest.join("wgl_bindings.rs")).unwrap();
@@ -24,9 +24,15 @@ fn main() {
                                         khronos_api::WGL_XML,
                                         vec![
                                             "WGL_ARB_create_context".to_string(),
-                                            "WGL_EXT_swap_control".to_string(),
-                                            "WGL_ARB_pixel_format".to_string(),
+                                            "WGL_ARB_create_context_profile".to_string(),
+                                            "WGL_ARB_extensions_string".to_string(),
                                             "WGL_ARB_framebuffer_sRGB".to_string(),
+                                            "WGL_ARB_multisample".to_string(),
+                                            "WGL_ARB_pixel_format".to_string(),
+                                            "WGL_EXT_create_context_es2_profile".to_string(),
+                                            "WGL_EXT_extensions_string".to_string(),
+                                            "WGL_EXT_framebuffer_sRGB".to_string(),
+                                            "WGL_EXT_swap_control".to_string(),
                                         ],
                                         "1.0", "core", &mut file).unwrap();
     }
@@ -46,6 +52,8 @@ fn main() {
                                         khronos_api::GLX_XML,
                                         vec![
                                             "GLX_ARB_create_context".to_string(),
+                                            "GLX_ARB_framebuffer_sRGB".to_string(),
+                                            "GLX_EXT_framebuffer_sRGB".to_string(),
                                             "GLX_EXT_swap_control".to_string(),
                                             "GLX_SGI_swap_control".to_string()
                                         ],

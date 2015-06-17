@@ -1,17 +1,22 @@
 #[cfg(feature = "headless")]
 pub use self::headless::HeadlessContext;
 
-use {CreationError, Event, MouseCursor};
+use {CreationError, Event, MouseCursor, CursorState};
 use CreationError::OsError;
 use libc;
 
 use Api;
 use BuilderAttribs;
 use GlRequest;
+use PixelFormat;
+use native_monitor::NativeMonitorId;
 
-use cocoa::base::{Class, id, YES, NO, NSUInteger, nil, objc_allocateClassPair, class, objc_registerClassPair};
-use cocoa::base::{selector, msg_send, msg_send_stret, class_addMethod, class_addIvar};
-use cocoa::base::{object_setInstanceVariable, object_getInstanceVariable};
+use objc::runtime::{Class, Object, Sel, BOOL, YES, NO};
+use objc::declare::ClassDecl;
+
+use cocoa::base::{id, nil};
+use cocoa::foundation::{NSAutoreleasePool, NSDate, NSDefaultRunLoopMode, NSPoint, NSRect, NSSize, 
+                        NSString, NSUInteger}; 
 use cocoa::appkit;
 use cocoa::appkit::*;
 use cocoa::appkit::NSEventSubtype::*;
@@ -20,17 +25,15 @@ use core_foundation::base::TCFType;
 use core_foundation::string::CFString;
 use core_foundation::bundle::{CFBundleGetBundleWithIdentifier, CFBundleGetFunctionPointerForName};
 
-use std::cell::Cell;
-use std::ffi::{CString, CStr};
-use std::mem;
-use std::ptr;
+use std::ffi::CStr;
 use std::collections::VecDeque;
 use std::str::FromStr;
 use std::str::from_utf8;
 use std::sync::Mutex;
 use std::ascii::AsciiExt;
+use std::ops::Deref;
 
-use events::Event::{MouseInput, MouseMoved, ReceivedCharacter, KeyboardInput, MouseWheel};
+use events::Event::{Awakened, MouseInput, MouseMoved, ReceivedCharacter, KeyboardInput, MouseWheel, Closed};
 use events::ElementState::{Pressed, Released};
 use events::MouseButton;
 use events;
@@ -50,126 +53,106 @@ static mut alt_pressed: bool = false;
 
 struct DelegateState {
     is_closed: bool,
-    context: id,
-    view: id,
-    window: id,
-    handler: Option<fn(u32, u32)>,
+    context: IdRef,
+    view: IdRef,
+    window: IdRef,
+    resize_handler: Option<fn(u32, u32)>,
+
+    /// Events that have been retreived with XLib but not dispatched with iterators yet
+    pending_events: Mutex<VecDeque<Event>>,
 }
 
 struct WindowDelegate {
-    this: id,
+    state: Box<DelegateState>,
+    _this: IdRef,
 }
 
 impl WindowDelegate {
-    fn class_name() -> &'static [u8] {
-        b"GlutinWindowDelegate\0"
-    }
-
-    fn state_ivar_name() -> &'static [u8] {
-        b"glutinState"
-    }
-
     /// Get the delegate class, initiailizing it neccessary
-    fn class() -> Class {
+    fn class() -> *const Class {
         use std::sync::{Once, ONCE_INIT};
-        use std::rt;
 
-        extern fn window_should_close(this: id, _: id) -> id {
+        extern fn window_should_close(this: &Object, _: Sel, _: id) -> BOOL {
             unsafe {
-                let delegate = WindowDelegate { this: this };
-                (*delegate.get_state()).is_closed = true;
-                mem::forget(delegate);
+                let state: *mut libc::c_void = *this.get_ivar("glutinState");
+                let state = state as *mut DelegateState;
+                (*state).is_closed = true;
+
+                (*state).pending_events.lock().unwrap().push_back(Closed);
             }
-            0
+            YES
         }
 
-        extern fn window_did_resize(this: id, _: id) -> id {
+        extern fn window_did_resize(this: &Object, _: Sel, _: id) {
             unsafe {
-                let delegate = WindowDelegate { this: this };
-                let state = &mut *delegate.get_state();
-                mem::forget(delegate);
+                let state: *mut libc::c_void = *this.get_ivar("glutinState");
+                let state = &mut *(state as *mut DelegateState);
 
-                let _: id = msg_send()(state.context, selector("update"));
+                let _: () = msg_send![*state.context, update];
 
-                if let Some(handler) = state.handler {
-                    let rect = NSView::frame(state.view);
-                    let scale_factor = NSWindow::backingScaleFactor(state.window) as f32;
+                if let Some(handler) = state.resize_handler {
+                    let rect = NSView::frame(*state.view);
+                    let scale_factor = NSWindow::backingScaleFactor(*state.window) as f32;
                     (handler)((scale_factor * rect.size.width as f32) as u32,
                               (scale_factor * rect.size.height as f32) as u32);
                 }
             }
-            0
         }
 
-        static mut delegate_class: Class = nil;
-        static mut init: Once = ONCE_INIT;
+        static mut delegate_class: *const Class = 0 as *const Class;
+        static INIT: Once = ONCE_INIT;
+
+        INIT.call_once(|| unsafe {
+            // Create new NSWindowDelegate
+            let superclass = Class::get("NSObject").unwrap();
+            let mut decl = ClassDecl::new(superclass, "GlutinWindowDelegate").unwrap();
+
+            // Add callback methods
+            decl.add_method(sel!(windowShouldClose:),
+                window_should_close as extern fn(&Object, Sel, id) -> BOOL);
+            decl.add_method(sel!(windowDidResize:),
+                window_did_resize as extern fn(&Object, Sel, id));
+
+            // Store internal state as user data
+            decl.add_ivar::<*mut libc::c_void>("glutinState");
+
+            delegate_class = decl.register();
+        });
 
         unsafe {
-            init.call_once(|| {
-                let ptr_size = mem::size_of::<libc::intptr_t>();
-                    // Create new NSWindowDelegate
-                    delegate_class = objc_allocateClassPair(
-                        class("NSObject"),
-                        WindowDelegate::class_name().as_ptr() as *const i8, 0);
-                    // Add callback methods
-                    class_addMethod(delegate_class,
-                                    selector("windowShouldClose:"),
-                                    window_should_close,
-                                    CString::new("B@:@").unwrap().as_ptr());
-                    class_addMethod(delegate_class,
-                                    selector("windowDidResize:"),
-                                    window_did_resize,
-                                    CString::new("V@:@").unwrap().as_ptr());
-                    // Store internal state as user data
-                    class_addIvar(delegate_class, WindowDelegate::state_ivar_name().as_ptr() as *const i8,
-                                  ptr_size as u64, 3,
-                                  CString::new("?").unwrap().as_ptr());
-                    objc_registerClassPair(delegate_class);
-                // Free class at exit
-                rt::at_exit(|| {
-                    // objc_disposeClassPair(delegate_class);
-                });
-            });
             delegate_class
         }
     }
 
-    fn new(window: id) -> WindowDelegate {
+    fn new(state: DelegateState) -> WindowDelegate {
+        // Box the state so we can give a pointer to it
+        let mut state = Box::new(state);
+        let state_ptr: *mut DelegateState = &mut *state;
         unsafe {
-            let delegate: id = msg_send()(WindowDelegate::class(), selector("new"));
-            let _: id = msg_send()(window, selector("setDelegate:"), delegate);
-            WindowDelegate { this: delegate }
+            let delegate = IdRef::new(msg_send![WindowDelegate::class(), new]);
+
+            (&mut **delegate).set_ivar("glutinState", state_ptr as *mut libc::c_void);
+            let _: () = msg_send![*state.window, setDelegate:*delegate];
+
+            WindowDelegate { state: state, _this: delegate }
         }
     }
+}
 
-    unsafe fn set_state(&self, state: *mut DelegateState) {
-        object_setInstanceVariable(self.this,
-                                   WindowDelegate::state_ivar_name().as_ptr() as *const i8,
-                                   state as *mut libc::c_void);
-    }
-
-    fn get_state(&self) -> *mut DelegateState {
+impl Drop for WindowDelegate {
+    fn drop(&mut self) {
         unsafe {
-            let mut state = ptr::null_mut();
-            object_getInstanceVariable(self.this,
-                                       WindowDelegate::state_ivar_name().as_ptr() as *const i8,
-                                       &mut state);
-            state as *mut DelegateState
+            // Nil the window's delegate so it doesn't still reference us
+            let _: () = msg_send![*self.state.window, setDelegate:nil];
         }
     }
 }
 
 pub struct Window {
-    view: id,
-    window: id,
-    context: id,
+    view: IdRef,
+    window: IdRef,
+    context: IdRef,
     delegate: WindowDelegate,
-    resize: Option<fn(u32, u32)>,
-
-    is_closed: Cell<bool>,
-
-    /// Events that have been retreived with XLib but not dispatched with iterators yet
-    pending_events: Mutex<VecDeque<Event>>,
 }
 
 #[cfg(feature = "window")]
@@ -203,7 +186,7 @@ impl<'a> Iterator for PollEventsIterator<'a> {
     type Item = Event;
 
     fn next(&mut self) -> Option<Event> {
-        if let Some(ev) = self.window.pending_events.lock().unwrap().pop_front() {
+        if let Some(ev) = self.window.delegate.state.pending_events.lock().unwrap().pop_front() {
             return Some(ev);
         }
 
@@ -214,25 +197,9 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                 NSDefaultRunLoopMode,
                 YES);
             if event == nil { return None; }
-            {
-                // Create a temporary structure with state that delegates called internally
-                // by sendEvent can read and modify. When that returns, update window state.
-                // This allows the synchronous resize loop to continue issuing callbacks
-                // to the user application, by passing handler through to the delegate state.
-                let mut ds = DelegateState {
-                    is_closed: self.window.is_closed.get(),
-                    context: self.window.context,
-                    window: self.window.window,
-                    view: self.window.view,
-                    handler: self.window.resize,
-                };
-                self.window.delegate.set_state(&mut ds);
-                NSApp().sendEvent_(event);
-                self.window.delegate.set_state(ptr::null_mut());
-                self.window.is_closed.set(ds.is_closed);
-            }
+            NSApp().sendEvent_(event);
 
-            let event = match msg_send()(event, selector("type")) {
+            let event = match msg_send![event, type] {
                 NSLeftMouseDown         => { Some(MouseInput(Pressed, MouseButton::Left)) },
                 NSLeftMouseUp           => { Some(MouseInput(Released, MouseButton::Left)) },
                 NSRightMouseDown        => { Some(MouseInput(Pressed, MouseButton::Right)) },
@@ -242,14 +209,14 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                 NSOtherMouseDragged     |
                 NSRightMouseDragged     => {
                     let window_point = event.locationInWindow();
-                    let window: id = msg_send()(event, selector("window"));
-                    let view_point = if window == 0 {
+                    let window: id = msg_send![event, window];
+                    let view_point = if window == nil {
                         let window_rect = self.window.window.convertRectFromScreen_(NSRect::new(window_point, NSSize::new(0.0, 0.0)));
                         self.window.view.convertPoint_fromView_(window_rect.origin, nil)
                     } else {
                         self.window.view.convertPoint_fromView_(window_point, nil)
                     };
-                    let view_rect = NSView::frame(self.window.view);
+                    let view_rect = NSView::frame(*self.window.view);
                     let scale_factor = self.window.hidpi_factor();
                     Some(MouseMoved(((scale_factor * view_point.x as f32) as i32,
                                     (scale_factor * (view_rect.size.height - view_point.y) as f32) as i32)))
@@ -267,7 +234,7 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                     let vkey =  event::vkeycode_to_element(NSEvent::keyCode(event));
                     events.push_back(KeyboardInput(Pressed, NSEvent::keyCode(event) as u8, vkey));
                     let event = events.pop_front();
-                    self.window.pending_events.lock().unwrap().extend(events.into_iter());
+                    self.window.delegate.state.pending_events.lock().unwrap().extend(events.into_iter());
                     event
                 },
                 NSKeyUp                 => {
@@ -297,12 +264,22 @@ impl<'a> Iterator for PollEventsIterator<'a> {
                         events.push_back(alt_modifier.unwrap());
                     }
                     let event = events.pop_front();
-                    self.window.pending_events.lock().unwrap().extend(events.into_iter());
+                    self.window.delegate.state.pending_events.lock().unwrap().extend(events.into_iter());
                     event
                 },
-                NSScrollWheel           => { Some(MouseWheel(event.scrollingDeltaY() as i32)) },
+                NSScrollWheel => {
+                    use events::MouseScrollDelta::{LineDelta, PixelDelta};
+                    let delta = if event.hasPreciseScrollingDeltas() == YES {
+                        PixelDelta(event.scrollingDeltaX() as f32, event.scrollingDeltaY() as f32)
+                    } else {
+                        LineDelta(event.scrollingDeltaX() as f32, event.scrollingDeltaY() as f32)
+                    };
+                    Some(MouseWheel(delta))
+                },
                 _                       => { None },
             };
+
+
 
             event
         }
@@ -318,7 +295,7 @@ impl<'a> Iterator for WaitEventsIterator<'a> {
 
     fn next(&mut self) -> Option<Event> {
         loop {
-            if let Some(ev) = self.window.pending_events.lock().unwrap().pop_front() {
+            if let Some(ev) = self.window.delegate.state.pending_events.lock().unwrap().pop_front() {
                 return Some(ev);
             }
 
@@ -333,6 +310,8 @@ impl<'a> Iterator for WaitEventsIterator<'a> {
             // calling poll_events()
             if let Some(ev) = self.window.poll_events().next() {
                 return Some(ev);
+            } else {
+                return Some(Awakened);
             }
         }
     }
@@ -356,12 +335,12 @@ impl Window {
             Some(window) => window,
             None         => { return Err(OsError(format!("Couldn't create NSWindow"))); },
         };
-        let view = match Window::create_view(window) {
+        let view = match Window::create_view(*window) {
             Some(view) => view,
             None       => { return Err(OsError(format!("Couldn't create NSView"))); },
         };
 
-        let context = match Window::create_context(view, builder.vsync, builder.gl_version) {
+        let context = match Window::create_context(*view, builder.vsync, builder.gl_version) {
             Some(context) => context,
             None          => { return Err(OsError(format!("Couldn't create OpenGL context"))); },
         };
@@ -375,15 +354,20 @@ impl Window {
             }
         }
 
+        let ds = DelegateState {
+            is_closed: false,
+            context: context.clone(),
+            view: view.clone(),
+            window: window.clone(),
+            resize_handler: None,
+            pending_events: Mutex::new(VecDeque::new()),
+        };
+
         let window = Window {
             view: view,
             window: window,
             context: context,
-            delegate: WindowDelegate::new(window),
-            resize: None,
-
-            is_closed: Cell::new(false),
-            pending_events: Mutex::new(VecDeque::new()),
+            delegate: WindowDelegate::new(ds),
         };
 
         Ok(window)
@@ -402,17 +386,43 @@ impl Window {
         }
     }
 
-    fn create_window(dimensions: (u32, u32), title: &str, monitor: Option<MonitorID>) -> Option<id> {
+    fn create_window(dimensions: (u32, u32), title: &str, monitor: Option<MonitorID>) -> Option<IdRef> {
         unsafe {
-            let frame = if monitor.is_some() {
-                let screen = NSScreen::mainScreen(nil);
-                NSScreen::frame(screen)
-            } else {
-                let (width, height) = dimensions;
-                NSRect::new(NSPoint::new(0., 0.), NSSize::new(width as f64, height as f64))
+            let screen = monitor.map(|monitor_id| {
+                let native_id = match monitor_id.get_native_identifier() {
+                    NativeMonitorId::Numeric(num) => num,
+                    _ => panic!("OS X monitors should always have a numeric native ID")
+                };
+                let matching_screen = {
+                    let screens = NSScreen::screens(nil);
+                    let count: NSUInteger = msg_send![screens, count];
+                    let key = IdRef::new(NSString::alloc(nil).init_str("NSScreenNumber"));
+                    let mut matching_screen: Option<id> = None;
+                    for i in (0..count) {
+                        let screen = msg_send![screens, objectAtIndex:i as NSUInteger];
+                        let device_description = NSScreen::deviceDescription(screen);
+                        let value: id = msg_send![device_description, objectForKey:*key];
+                        if value != nil {
+                            let screen_number: NSUInteger = msg_send![value, unsignedIntegerValue];
+                            if screen_number as u32 == native_id {
+                                matching_screen = Some(screen);
+                                break;
+                            }
+                        }
+                    }
+                    matching_screen
+                };
+                matching_screen.unwrap_or(NSScreen::mainScreen(nil))
+            });
+            let frame = match screen {
+                Some(screen) => NSScreen::frame(screen),
+                None => {
+                    let (width, height) = dimensions;
+                    NSRect::new(NSPoint::new(0., 0.), NSSize::new(width as f64, height as f64))
+                }
             };
 
-            let masks = if monitor.is_some() {
+            let masks = if screen.is_some() {
                 NSBorderlessWindowMask as NSUInteger
             } else {
                 NSTitledWindowMask as NSUInteger |
@@ -421,44 +431,39 @@ impl Window {
                 NSResizableWindowMask as NSUInteger
             };
 
-            let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+            let window = IdRef::new(NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
                 frame,
                 masks,
                 NSBackingStoreBuffered,
                 NO,
-            );
-
-            if window == nil {
-                None
-            } else {
-                let title = NSString::alloc(nil).init_str(title);
-                window.setTitle_(title);
+            ));
+            window.non_nil().map(|window| {
+                let title = IdRef::new(NSString::alloc(nil).init_str(title));
+                window.setTitle_(*title);
                 window.setAcceptsMouseMovedEvents_(YES);
-                if monitor.is_some() {
+                if screen.is_some() {
                     window.setLevel_(NSMainMenuWindowLevel as i64 + 1);
                 }
                 else {
                     window.center();
                 }
-                Some(window)
-            }
+                window
+            })
         }
     }
 
-    fn create_view(window: id) -> Option<id> {
+    fn create_view(window: id) -> Option<IdRef> {
         unsafe {
-            let view = NSView::alloc(nil).init();
-            if view == nil {
-                None
-            } else {
+            let view = IdRef::new(NSView::alloc(nil).init());
+            view.non_nil().map(|view| {
                 view.setWantsBestResolutionOpenGLSurface_(YES);
-                window.setContentView_(view);
-                Some(view)
-            }
+                window.setContentView_(*view);
+                view
+            })
         }
     }
 
-    fn create_context(view: id, vsync: bool, gl_version: GlRequest) -> Option<id> {
+    fn create_context(view: id, vsync: bool, gl_version: GlRequest) -> Option<IdRef> {
         let profile = match gl_version {
             GlRequest::Latest => NSOpenGLProfileVersion4_1Core as u32,
             GlRequest::Specific(Api::OpenGl, (1 ... 2, _)) => NSOpenGLProfileVersionLegacy as u32,
@@ -483,47 +488,43 @@ impl Window {
                 0
             ];
 
-            let pixelformat = NSOpenGLPixelFormat::alloc(nil).initWithAttributes_(&attributes);
-            if pixelformat == nil {
-                return None;
-            }
-
-            let context = NSOpenGLContext::alloc(nil).initWithFormat_shareContext_(pixelformat, nil);
-            if context == nil {
-                None
-            } else {
-                context.setView_(view);
-                if vsync {
-                    let value = 1;
-                    context.setValues_forParameter_(&value, NSOpenGLContextParameter::NSOpenGLCPSwapInterval);
-                }
-                Some(context)
-            }
+            let pixelformat = IdRef::new(NSOpenGLPixelFormat::alloc(nil).initWithAttributes_(&attributes));
+            pixelformat.non_nil().map(|pixelformat| {
+                let context = IdRef::new(NSOpenGLContext::alloc(nil).initWithFormat_shareContext_(*pixelformat, nil));
+                context.non_nil().map(|context| {
+                    context.setView_(view);
+                    if vsync {
+                        let value = 1;
+                        context.setValues_forParameter_(&value, NSOpenGLContextParameter::NSOpenGLCPSwapInterval);
+                    }
+                    context
+                })
+            }).unwrap_or(None)
         }
     }
 
     pub fn is_closed(&self) -> bool {
-        self.is_closed.get()
+        self.delegate.state.is_closed
     }
 
     pub fn set_title(&self, title: &str) {
         unsafe {
-            let title = NSString::alloc(nil).init_str(title);
-            self.window.setTitle_(title);
+            let title = IdRef::new(NSString::alloc(nil).init_str(title));
+            self.window.setTitle_(*title);
         }
     }
 
     pub fn show(&self) {
-        unsafe { NSWindow::makeKeyAndOrderFront_(self.window, nil); }
+        unsafe { NSWindow::makeKeyAndOrderFront_(*self.window, nil); }
     }
 
     pub fn hide(&self) {
-        unsafe { NSWindow::orderOut_(self.window, nil); }
+        unsafe { NSWindow::orderOut_(*self.window, nil); }
     }
 
     pub fn get_position(&self) -> Option<(i32, i32)> {
         unsafe {
-            let content_rect = NSWindow::contentRectForFrameRect_(self.window, NSWindow::frame(self.window));
+            let content_rect = NSWindow::contentRectForFrameRect_(*self.window, NSWindow::frame(*self.window));
             // NOTE: coordinate system might be inconsistent with other backends
             Some((content_rect.origin.x as i32, content_rect.origin.y as i32))
         }
@@ -532,27 +533,27 @@ impl Window {
     pub fn set_position(&self, x: i32, y: i32) {
         unsafe {
             // NOTE: coordinate system might be inconsistent with other backends
-            NSWindow::setFrameOrigin_(self.window, NSPoint::new(x as f64, y as f64));
+            NSWindow::setFrameOrigin_(*self.window, NSPoint::new(x as f64, y as f64));
         }
     }
 
     pub fn get_inner_size(&self) -> Option<(u32, u32)> {
         unsafe {
-            let view_frame = NSView::frame(self.view);
+            let view_frame = NSView::frame(*self.view);
             Some((view_frame.size.width as u32, view_frame.size.height as u32))
         }
     }
 
     pub fn get_outer_size(&self) -> Option<(u32, u32)> {
         unsafe {
-            let window_frame = NSWindow::frame(self.window);
+            let window_frame = NSWindow::frame(*self.window);
             Some((window_frame.size.width as u32, window_frame.size.height as u32))
         }
     }
 
     pub fn set_inner_size(&self, width: u32, height: u32) {
         unsafe {
-            NSWindow::setContentSize_(self.window, NSSize::new(width as f64, height as f64));
+            NSWindow::setContentSize_(*self.window, NSSize::new(width as f64, height as f64));
         }
     }
 
@@ -583,12 +584,20 @@ impl Window {
     }
 
     pub unsafe fn make_current(&self) {
-        let _: id = msg_send()(self.context, selector("update"));
+        let _: () = msg_send![*self.context, update];
         self.context.makeCurrentContext();
     }
 
     pub fn is_current(&self) -> bool {
-        unimplemented!()
+        unsafe {
+            let current = NSOpenGLContext::currentContext(nil);
+            if current != nil {
+                let is_equal: BOOL = msg_send![current, isEqual:*self.context];
+                is_equal != NO
+            } else {
+                false
+            }
+        }
     }
 
     pub fn get_proc_address(&self, _addr: &str) -> *const () {
@@ -619,49 +628,72 @@ impl Window {
         ::Api::OpenGl
     }
 
+    pub fn get_pixel_format(&self) -> PixelFormat {
+        unimplemented!();
+    }
+
     pub fn set_window_resize_callback(&mut self, callback: Option<fn(u32, u32)>) {
-        self.resize = callback;
+        self.delegate.state.resize_handler = callback;
     }
 
     pub fn set_cursor(&self, cursor: MouseCursor) {
         let cursor_name = match cursor {                
-            MouseCursor::Arrow => "arrowCursor",
+            MouseCursor::Arrow | MouseCursor::Default => "arrowCursor",
+            MouseCursor::Hand => "pointingHandCursor",
+            MouseCursor::Grabbing | MouseCursor::Grab => "closedHandCursor",
             MouseCursor::Text => "IBeamCursor",
-            MouseCursor::ContextMenu => "contextualMenuCursor",
+            MouseCursor::VerticalText => "IBeamCursorForVerticalLayout",
             MouseCursor::Copy => "dragCopyCursor",
-            MouseCursor::Crosshair => "crosshairCursor",
-            MouseCursor::Default => "arrowCursor",
-            MouseCursor::Grabbing => "openHandCursor",
-            MouseCursor::Hand | MouseCursor::Grab => "pointingHandCursor",
-            MouseCursor::NoDrop => "operationNotAllowedCursor",
-            MouseCursor::NotAllowed => "operationNotAllowedCursor",
             MouseCursor::Alias => "dragLinkCursor",
-            
-            
-            /// Resize cursors
-            MouseCursor::EResize | MouseCursor::NResize |
-            MouseCursor::NeResize | MouseCursor::NwResize |
-            MouseCursor::SResize | MouseCursor::SeResize |
-            MouseCursor::SwResize | MouseCursor::WResize |
-            MouseCursor::EwResize | MouseCursor::ColResize |
-            MouseCursor::NsResize | MouseCursor::RowResize |
-            MouseCursor::NwseResize | MouseCursor::NeswResize => "arrowCursor",
+            MouseCursor::NotAllowed | MouseCursor::NoDrop => "operationNotAllowedCursor",
+            MouseCursor::ContextMenu => "contextualMenuCursor",
+            MouseCursor::Crosshair => "crosshairCursor",
+            MouseCursor::EResize => "resizeRightCursor",
+            MouseCursor::NResize => "resizeUpCursor",
+            MouseCursor::WResize => "resizeLeftCursor",
+            MouseCursor::SResize => "resizeDownCursor",
+            MouseCursor::EwResize | MouseCursor::ColResize => "resizeLeftRightCursor",
+            MouseCursor::NsResize | MouseCursor::RowResize => "resizeUpDownCursor",
 
             /// TODO: Find appropriate OSX cursors
-             MouseCursor::Cell | MouseCursor::VerticalText | MouseCursor::NoneCursor |
+            MouseCursor::NeResize | MouseCursor::NwResize |
+            MouseCursor::SeResize | MouseCursor::SwResize |
+            MouseCursor::NwseResize | MouseCursor::NeswResize |
+
+            MouseCursor::Cell | MouseCursor::NoneCursor |
             MouseCursor::Wait | MouseCursor::Progress | MouseCursor::Help |
             MouseCursor::Move | MouseCursor::AllScroll | MouseCursor::ZoomIn |
             MouseCursor::ZoomOut => "arrowCursor",
         };
+        let sel = Sel::register(cursor_name);
+        let cls = Class::get("NSCursor").unwrap();
         unsafe {
-            let cursor : id = msg_send()(class("NSCursor"), selector(cursor_name));
-            let _ : id = msg_send()(cursor, selector("set"));
+            use objc::MessageArguments;
+            let cursor: id = ().send(cls as *const _ as id, sel);
+            let _: () = msg_send![cursor, set];
+        }
+    }
+
+    pub fn set_cursor_state(&self, state: CursorState) -> Result<(), String> {
+        let cls = Class::get("NSCursor").unwrap();
+        match state {
+            CursorState::Normal => {
+                let _: () = unsafe { msg_send![cls, unhide] };
+                Ok(())
+            },
+            CursorState::Hide => {
+                let _: () = unsafe { msg_send![cls, hide] };
+                Ok(())
+            },
+            CursorState::Grab => {
+                Err("Mouse grabbing is unimplemented".to_string())
+            }
         }
     }
 
     pub fn hidpi_factor(&self) -> f32 {
         unsafe {
-            NSWindow::backingScaleFactor(self.window) as f32
+            NSWindow::backingScaleFactor(*self.window) as f32
         }
     }
 
@@ -669,3 +701,47 @@ impl Window {
         unimplemented!();
     }
 }
+
+struct IdRef(id);
+
+impl IdRef {
+    fn new(i: id) -> IdRef {
+        IdRef(i)
+    }
+
+    fn retain(i: id) -> IdRef {
+        if i != nil {
+            let _: id = unsafe { msg_send![i, retain] };
+        }
+        IdRef(i)
+    }
+
+    fn non_nil(self) -> Option<IdRef> {
+        if self.0 == nil { None } else { Some(self) }
+    }
+}
+
+impl Drop for IdRef {
+    fn drop(&mut self) {
+        if self.0 != nil {
+            let _: () = unsafe { msg_send![self.0, release] };
+        }
+    }
+}
+
+impl Deref for IdRef {
+    type Target = id;
+    fn deref<'a>(&'a self) -> &'a id {
+        &self.0
+    }
+}
+
+impl Clone for IdRef {
+    fn clone(&self) -> IdRef {
+        if self.0 != nil {
+            let _: id = unsafe { msg_send![self.0, retain] };
+        }
+        IdRef(self.0)
+    }
+}
+

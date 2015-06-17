@@ -1,7 +1,8 @@
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
+use std::io;
 use std::ptr;
 use std::mem;
-use std::os;
 use std::thread;
 
 use super::callback;
@@ -15,10 +16,12 @@ use Api;
 use BuilderAttribs;
 use CreationError;
 use CreationError::OsError;
+use CursorState;
 use GlRequest;
 use PixelFormat;
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString, OsStr};
+use std::os::windows::ffi::OsStrExt;
 use std::sync::mpsc::channel;
 
 use libc;
@@ -36,8 +39,9 @@ pub fn new_window(builder: BuilderAttribs<'static>, builder_sharelists: Option<C
                   -> Result<Window, CreationError>
 {
     // initializing variables to be sent to the task
-    let title = builder.title.as_slice().utf16_units()
-                       .chain(Some(0).into_iter()).collect::<Vec<u16>>();    // title to utf16
+
+    let title = OsStr::new(&builder.title).encode_wide().chain(Some(0).into_iter())
+                                          .collect::<Vec<_>>();
 
     let (tx, rx) = channel();
 
@@ -120,13 +124,13 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
 
             if handle.is_null() {
                 return Err(OsError(format!("CreateWindowEx function failed: {}",
-                                           os::error_string(os::errno()))));
+                                           format!("{}", io::Error::last_os_error()))));
             }
 
             let hdc = user32::GetDC(handle);
             if hdc.is_null() {
                 let err = Err(OsError(format!("GetDC function failed: {}",
-                                              os::error_string(os::errno()))));
+                                              format!("{}", io::Error::last_os_error()))));
                 return err;
             }
 
@@ -136,7 +140,7 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
         // getting the pixel format that we will use and setting it
         {
             let formats = enumerate_native_pixel_formats(&dummy_window);
-            let (id, _) = builder.choose_pixel_format(formats.into_iter().map(|(a, b)| (b, a)));
+            let id = try!(choose_dummy_pixel_format(formats.into_iter()));
             try!(set_pixel_format(&dummy_window, id));
         }
 
@@ -164,6 +168,12 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
             (None, None)
         };
 
+        let (x, y) = if builder.monitor.is_some() {
+            (Some(rect.left), Some(rect.top))
+        } else {
+            (None, None)
+        };
+
         let style = if !builder.visible || builder.headless {
             style
         } else {
@@ -173,37 +183,37 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
         let handle = user32::CreateWindowExW(ex_style, class_name.as_ptr(),
             title.as_ptr() as winapi::LPCWSTR,
             style | winapi::WS_CLIPSIBLINGS | winapi::WS_CLIPCHILDREN,
-            if builder.monitor.is_some() { 0 } else { winapi::CW_USEDEFAULT },
-            if builder.monitor.is_some() { 0 } else { winapi::CW_USEDEFAULT },
+            x.unwrap_or(winapi::CW_USEDEFAULT), y.unwrap_or(winapi::CW_USEDEFAULT),
             width.unwrap_or(winapi::CW_USEDEFAULT), height.unwrap_or(winapi::CW_USEDEFAULT),
             ptr::null_mut(), ptr::null_mut(), kernel32::GetModuleHandleW(ptr::null()),
             ptr::null_mut());
 
         if handle.is_null() {
             return Err(OsError(format!("CreateWindowEx function failed: {}",
-                                       os::error_string(os::errno()))));
+                                       format!("{}", io::Error::last_os_error()))));
         }
 
         let hdc = user32::GetDC(handle);
         if hdc.is_null() {
             return Err(OsError(format!("GetDC function failed: {}",
-                                       os::error_string(os::errno()))));
+                                       format!("{}", io::Error::last_os_error()))));
         }
 
         WindowWrapper(handle, hdc)
     };
 
     // calling SetPixelFormat
-    {
+    let pixel_format = {
         let formats = if extra_functions.GetPixelFormatAttribivARB.is_loaded() {
             enumerate_arb_pixel_formats(&extra_functions, &real_window)
         } else {
             enumerate_native_pixel_formats(&real_window)
         };
 
-        let (id, _) = builder.choose_pixel_format(formats.into_iter().map(|(a, b)| (b, a)));
+        let (id, f) = try!(builder.choose_pixel_format(formats.into_iter().map(|(a, b)| (b, a))));
         try!(set_pixel_format(&real_window, id));
-    }
+        f
+    };
 
     // creating the OpenGL context
     let context = try!(create_context(Some((&extra_functions, &builder)), &real_window,
@@ -214,12 +224,20 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
         user32::SetForegroundWindow(real_window.0);
     }
 
-    // filling the WINDOW task-local storage so that we can start receiving events
+    // Creating a mutex to track the current cursor state
+    let cursor_state = Arc::new(Mutex::new(CursorState::Normal));
+
+    // filling the CONTEXT_STASH task-local storage so that we can start receiving events
     let events_receiver = {
         let (tx, rx) = channel();
         let mut tx = Some(tx);
-        callback::WINDOW.with(|window| {
-            (*window.borrow_mut()) = Some((real_window.0, tx.take().unwrap()));
+        callback::CONTEXT_STASH.with(|context_stash| {
+            let data = callback::ThreadLocalData {
+                win: real_window.0,
+                sender: tx.take().unwrap(),
+                cursor_state: cursor_state.clone()
+            };
+            (*context_stash.borrow_mut()) = Some(data);
         });
         rx
     };
@@ -230,7 +248,7 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
     // handling vsync
     if builder.vsync {
         if extra_functions.SwapIntervalEXT.is_loaded() {
-            let guard = try!(CurrentContextGuard::make_current(&real_window, &context));
+            let _guard = try!(CurrentContextGuard::make_current(&real_window, &context));
 
             if extra_functions.SwapIntervalEXT(1) == 0 {
                 return Err(OsError(format!("wglSwapIntervalEXT failed")));
@@ -245,12 +263,14 @@ unsafe fn init(title: Vec<u16>, builder: BuilderAttribs<'static>,
         gl_library: gl_library,
         events_receiver: events_receiver,
         is_closed: AtomicBool::new(false),
+        cursor_state: cursor_state,
+        pixel_format: pixel_format,
     })
 }
 
 unsafe fn register_window_class() -> Vec<u16> {
-    let class_name: Vec<u16> = "Window Class".utf16_units().chain(Some(0).into_iter())
-                                             .collect::<Vec<u16>>();
+    let class_name = OsStr::new("Window Class").encode_wide().chain(Some(0).into_iter())
+                                               .collect::<Vec<_>>();
     
     let class = winapi::WNDCLASSEXW {
         cbSize: mem::size_of::<winapi::WNDCLASSEXW>() as winapi::UINT,
@@ -260,7 +280,7 @@ unsafe fn register_window_class() -> Vec<u16> {
         cbWndExtra: 0,
         hInstance: kernel32::GetModuleHandleW(ptr::null()),
         hIcon: ptr::null_mut(),
-        hCursor: ptr::null_mut(),
+        hCursor: ptr::null_mut(),       // must be null in order for cursor state to work properly
         hbrBackground: ptr::null_mut(),
         lpszMenuName: ptr::null(),
         lpszClassName: class_name.as_ptr(),
@@ -296,7 +316,7 @@ unsafe fn switch_to_fullscreen(rect: &mut winapi::RECT, monitor: &MonitorID)
     screen_settings.dmBitsPerPel = 32;      // TODO: ?
     screen_settings.dmFields = winapi::DM_BITSPERPEL | winapi::DM_PELSWIDTH | winapi::DM_PELSHEIGHT;
 
-    let result = user32::ChangeDisplaySettingsExW(monitor.get_system_name().as_ptr(),
+    let result = user32::ChangeDisplaySettingsExW(monitor.get_adapter_name().as_ptr(),
                                                   &mut screen_settings, ptr::null_mut(),
                                                   winapi::CDS_FULLSCREEN, ptr::null_mut());
     
@@ -325,7 +345,22 @@ unsafe fn create_context(extra: Option<(&gl::wgl_extra::Wgl, &BuilderAttribs<'st
                     attributes.push(gl::wgl_extra::CONTEXT_MINOR_VERSION_ARB as libc::c_int);
                     attributes.push(minor as libc::c_int);
                 },
-                GlRequest::Specific(_, _) => panic!("Only OpenGL is supported"),
+                GlRequest::Specific(Api::OpenGlEs, (major, minor)) => {
+                    if is_extension_supported(extra_functions, hdc,
+                                              "WGL_EXT_create_context_es2_profile")
+                    {
+                        attributes.push(gl::wgl_extra::CONTEXT_PROFILE_MASK_ARB as libc::c_int);
+                        attributes.push(gl::wgl_extra::CONTEXT_ES2_PROFILE_BIT_EXT as libc::c_int);
+                    } else {
+                        return Err(CreationError::NotSupported);
+                    }
+
+                    attributes.push(gl::wgl_extra::CONTEXT_MAJOR_VERSION_ARB as libc::c_int);
+                    attributes.push(major as libc::c_int);
+                    attributes.push(gl::wgl_extra::CONTEXT_MINOR_VERSION_ARB as libc::c_int);
+                    attributes.push(minor as libc::c_int);
+                },
+                GlRequest::Specific(_, _) => return Err(CreationError::NotSupported),
                 GlRequest::GlThenGles { opengl_version: (major, minor), .. } => {
                     attributes.push(gl::wgl_extra::CONTEXT_MAJOR_VERSION_ARB as libc::c_int);
                     attributes.push(major as libc::c_int);
@@ -343,7 +378,7 @@ unsafe fn create_context(extra: Option<(&gl::wgl_extra::Wgl, &BuilderAttribs<'st
 
             Some(extra_functions.CreateContextAttribsARB(hdc.1 as *const libc::c_void,
                                                          share as *const libc::c_void,
-                                                         attributes.as_slice().as_ptr()))
+                                                         attributes.as_ptr()))
 
         } else {
             None
@@ -365,7 +400,7 @@ unsafe fn create_context(extra: Option<(&gl::wgl_extra::Wgl, &BuilderAttribs<'st
 
     if ctxt.is_null() {
         return Err(OsError(format!("OpenGL context creation failed: {}",
-                           os::error_string(os::errno()))));
+                           format!("{}", io::Error::last_os_error()))));
     }
 
     Ok(ContextWrapper(ctxt as winapi::HGLRC))
@@ -457,8 +492,23 @@ unsafe fn enumerate_arb_pixel_formats(extra: &gl::wgl_extra::Wgl, hdc: &WindowWr
             stencil_bits: get_info(index, gl::wgl_extra::STENCIL_BITS_ARB) as u8,
             stereoscopy: get_info(index, gl::wgl_extra::STEREO_ARB) != 0,
             double_buffer: get_info(index, gl::wgl_extra::DOUBLE_BUFFER_ARB) != 0,
-            multisampling: None,        // FIXME: 
-            srgb: false,        // FIXME: 
+            multisampling: {
+                if is_extension_supported(extra, hdc, "WGL_ARB_multisample") {
+                    match get_info(index, gl::wgl_extra::SAMPLES_ARB) {
+                        0 => None,
+                        a => Some(a as u16),
+                    }
+                } else {
+                    None
+                }
+            },
+            srgb: if is_extension_supported(extra, hdc, "WGL_ARB_framebuffer_sRGB") {
+                get_info(index, gl::wgl_extra::FRAMEBUFFER_SRGB_CAPABLE_ARB) != 0
+            } else if is_extension_supported(extra, hdc, "WGL_EXT_framebuffer_sRGB") {
+                get_info(index, gl::wgl_extra::FRAMEBUFFER_SRGB_CAPABLE_EXT) != 0
+            } else {
+                false
+            },
         }, index as libc::c_int));
     }
 
@@ -472,27 +522,65 @@ unsafe fn set_pixel_format(hdc: &WindowWrapper, id: libc::c_int) -> Result<(), C
                                   as winapi::UINT, &mut output) == 0
     {
         return Err(OsError(format!("DescribePixelFormat function failed: {}",
-                                   os::error_string(os::errno()))));
+                                   format!("{}", io::Error::last_os_error()))));
     }
 
     if gdi32::SetPixelFormat(hdc.1, id, &output) == 0 {
         return Err(OsError(format!("SetPixelFormat function failed: {}",
-                                   os::error_string(os::errno()))));
+                                   format!("{}", io::Error::last_os_error()))));
     }
 
     Ok(())
 }
 
 unsafe fn load_opengl32_dll() -> Result<winapi::HMODULE, CreationError> {
-    let name = "opengl32.dll".utf16_units().chain(Some(0).into_iter())
-                             .collect::<Vec<u16>>().as_ptr();
+    let name = OsStr::new("opengl32.dll").encode_wide().chain(Some(0).into_iter())
+                                         .collect::<Vec<_>>();
 
-    let lib = kernel32::LoadLibraryW(name);
+    let lib = kernel32::LoadLibraryW(name.as_ptr());
 
     if lib.is_null() {
         return Err(OsError(format!("LoadLibrary function failed: {}",
-                                    os::error_string(os::errno()))));
+                                    format!("{}", io::Error::last_os_error()))));
     }
 
     Ok(lib)
+}
+
+unsafe fn is_extension_supported(extra: &gl::wgl_extra::Wgl, hdc: &WindowWrapper,
+                                 extension: &str) -> bool
+{
+    let extensions = if extra.GetExtensionsStringARB.is_loaded() {
+        let data = extra.GetExtensionsStringARB(hdc.1 as *const _);
+        let data = CStr::from_ptr(data).to_bytes().to_vec();
+        String::from_utf8(data).unwrap()
+
+    } else if extra.GetExtensionsStringEXT.is_loaded() {
+        let data = extra.GetExtensionsStringEXT();
+        let data = CStr::from_ptr(data).to_bytes().to_vec();
+        String::from_utf8(data).unwrap()
+
+    } else {
+        return false;
+    };
+
+    extensions.split(" ").find(|&e| e == extension).is_some()
+}
+
+fn choose_dummy_pixel_format<I>(iter: I) -> Result<libc::c_int, CreationError>
+                                where I: Iterator<Item=(PixelFormat, libc::c_int)>
+{
+    let mut backup_id = None;
+
+    for (format, id) in iter {
+        if backup_id.is_none() {
+            backup_id = Some(id);
+        }
+
+        if format.hardware_accelerated {
+            return Ok(id);
+        }
+    }
+
+    backup_id.ok_or(CreationError::NotSupported)
 }

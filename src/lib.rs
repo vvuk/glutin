@@ -1,6 +1,3 @@
-#![feature(unsafe_destructor,core,std_misc)]
-#![unstable]
-
 //! The purpose of this library is to provide an OpenGL context on as many
 //!  platforms as possible.
 //!
@@ -26,47 +23,61 @@
 //!
 //! By default only `window` is enabled.
 
+#![feature(alloc)]
+
+#[macro_use]
+extern crate lazy_static;
+
 extern crate gl_common;
 extern crate libc;
 
 #[cfg(target_os = "windows")]
 extern crate winapi;
 #[cfg(target_os = "windows")]
-extern crate "kernel32-sys" as kernel32;
+extern crate kernel32;
 #[cfg(target_os = "windows")]
-extern crate "gdi32-sys" as gdi32;
+extern crate gdi32;
 #[cfg(target_os = "windows")]
-extern crate "user32-sys" as user32;
+extern crate user32;
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
 #[cfg(target_os = "macos")]
 extern crate cocoa;
 #[cfg(target_os = "macos")]
 extern crate core_foundation;
 #[cfg(target_os = "macos")]
 extern crate core_graphics;
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+extern crate x11;
+#[cfg(all(any(target_os = "linux", target_os = "freebsd"), feature="headless"))]
+extern crate osmesa_sys;
 
 pub use events::*;
 #[cfg(feature = "headless")]
 pub use headless::{HeadlessRendererBuilder, HeadlessContext};
 #[cfg(feature = "window")]
-pub use window::{WindowBuilder, Window, WindowProxy, PollEventsIterator, WaitEventsIterator};
+pub use window::{WindowBuilder, Window, WindowID, WindowProxy, PollEventsIterator, WaitEventsIterator};
 #[cfg(feature = "window")]
 pub use window::{AvailableMonitorsIter, MonitorID, get_available_monitors, get_primary_monitor};
+#[cfg(feature = "window")]
+pub use native_monitor::NativeMonitorId;
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "linux"), not(target_os = "macos"), not(target_os = "android")))]
 use this_platform_is_not_supported;
 
 #[cfg(target_os = "windows")]
 #[path="win32/mod.rs"]
-mod winimpl;
+mod platform;
 #[cfg(target_os = "linux")]
 #[path="x11/mod.rs"]
-mod winimpl;
+mod platform;
 #[cfg(target_os = "macos")]
 #[path="cocoa/mod.rs"]
-mod winimpl;
+mod platform;
 #[cfg(target_os = "android")]
 #[path="android/mod.rs"]
-mod winimpl;
+mod platform;
 
 mod events;
 #[cfg(feature = "headless")]
@@ -84,7 +95,7 @@ pub enum CreationError {
 impl CreationError {
     fn to_string(&self) -> &str {
         match *self {
-            CreationError::OsError(ref text) => text.as_slice(),
+            CreationError::OsError(ref text) => &text,
             CreationError::NotSupported => "Some of the requested attributes are not supported",
         }
     }
@@ -137,7 +148,7 @@ pub enum GlRequest {
     },
 }
 
-#[derive(Debug, Copy)]
+#[derive(Debug, Copy, Clone)]
 pub enum MouseCursor {
     /// The platform-dependent default cursor.
     Default,
@@ -193,6 +204,23 @@ pub enum MouseCursor {
     RowResize,
 }
 
+/// Describes how glutin handles the cursor.
+#[derive(Debug, Copy, Clone)]
+pub enum CursorState {
+    /// Normal cursor behavior.
+    Normal,
+
+    /// The cursor will be invisible when over the window.
+    Hide,
+
+    /// Grabs the mouse cursor. The cursor's motion will be confined to this
+    /// window and the window has exclusive access to further events regarding
+    /// the cursor.
+    ///
+    /// This is useful for first-person cameras for example.
+    Grab,
+}
+
 /// Describes a possible format. Unused.
 #[allow(missing_docs)]
 #[derive(Debug, Clone)]
@@ -211,14 +239,16 @@ pub struct PixelFormat {
 }
 
 /// Attributes
-struct BuilderAttribs<'a> {
+// FIXME: remove `pub` (https://github.com/rust-lang/rust/issues/23585)
+#[doc(hidden)]
+pub struct BuilderAttribs<'a> {
     #[allow(dead_code)]
     headless: bool,
     strict: bool,
-    sharing: Option<&'a winimpl::Window>,
+    sharing: Option<&'a platform::Window>,
     dimensions: Option<(u32, u32)>,
     title: String,
-    monitor: Option<winimpl::MonitorID>,
+    monitor: Option<platform::MonitorID>,
     gl_version: GlRequest,
     gl_debug: bool,
     vsync: bool,
@@ -229,6 +259,8 @@ struct BuilderAttribs<'a> {
     color_bits: Option<u8>,
     alpha_bits: Option<u8>,
     stereoscopy: bool,
+    srgb: Option<bool>,
+    parent: *mut libc::c_void,
 }
 
 impl BuilderAttribs<'static> {
@@ -241,7 +273,7 @@ impl BuilderAttribs<'static> {
             title: "glutin window".to_string(),
             monitor: None,
             gl_version: GlRequest::Latest,
-            gl_debug: cfg!(ndebug),
+            gl_debug: cfg!(debug_assertions),
             vsync: false,
             visible: true,
             multisampling: None,
@@ -250,12 +282,14 @@ impl BuilderAttribs<'static> {
             color_bits: None,
             alpha_bits: None,
             stereoscopy: false,
+            srgb: None,
+            parent: std::ptr::null_mut(),
         }
     }
 }
 
 impl<'a> BuilderAttribs<'a> {
-    fn extract_non_static(mut self) -> (BuilderAttribs<'static>, Option<&'a winimpl::Window>) {
+    fn extract_non_static(mut self) -> (BuilderAttribs<'static>, Option<&'a platform::Window>) {
         let sharing = self.sharing.take();
 
         let new_attribs = BuilderAttribs {
@@ -275,12 +309,14 @@ impl<'a> BuilderAttribs<'a> {
             color_bits: self.color_bits,
             alpha_bits: self.alpha_bits,
             stereoscopy: self.stereoscopy,
+            srgb: self.srgb,
+            parent: self.parent,
         };
 
         (new_attribs, sharing)
     }
 
-    fn choose_pixel_format<T, I>(&self, iter: I) -> (T, PixelFormat)
+    fn choose_pixel_format<T, I>(&self, iter: I) -> Result<(T, PixelFormat), CreationError>
                                  where I: Iterator<Item=(T, PixelFormat)>, T: Clone
     {
         let mut current_result = None;
@@ -312,6 +348,12 @@ impl<'a> BuilderAttribs<'a> {
                 continue;
             }
 
+            if let Some(srgb) = self.srgb {
+                if srgb != format.srgb {
+                    continue;
+                }
+            }
+
             current_software_result = Some((id.clone(), format.clone()));
             if format.hardware_accelerated {
                 current_result = Some((id, format));
@@ -319,6 +361,23 @@ impl<'a> BuilderAttribs<'a> {
         }
 
         current_result.or(current_software_result)
-                      .expect("Could not find compliant pixel format")
+                      .ok_or(CreationError::NotSupported)
     }
 }
+
+mod native_monitor {
+    /// Native platform identifier for a monitor. Different platforms use fundamentally different types
+    /// to represent a monitor ID.
+    #[derive(PartialEq, Eq)]
+    pub enum NativeMonitorId {
+        /// Cocoa and X11 use a numeric identifier to represent a monitor.
+        Numeric(u32),
+
+        /// Win32 uses a Unicode string to represent a monitor.
+        Name(String),
+
+        /// Other platforms (Android) don't support monitor identification.
+        Unavailable
+    }
+}
+

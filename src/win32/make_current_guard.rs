@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::os;
+use std::io;
 
 use libc;
 use winapi;
@@ -30,7 +30,7 @@ impl<'a, 'b> CurrentContextGuard<'a, 'b> {
 
         if result == 0 {
             return Err(CreationError::OsError(format!("wglMakeCurrent function failed: {}",
-                                                      os::error_string(os::errno()))));
+                                                      format!("{}", io::Error::last_os_error()))));
         }
 
         Ok(CurrentContextGuard {
@@ -42,7 +42,6 @@ impl<'a, 'b> CurrentContextGuard<'a, 'b> {
     }
 }
 
-#[unsafe_destructor]
 impl<'a, 'b> Drop for CurrentContextGuard<'a, 'b> {
     fn drop(&mut self) {
         unsafe {

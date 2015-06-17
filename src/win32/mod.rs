@@ -1,11 +1,19 @@
 use std::sync::atomic::AtomicBool;
+use std::mem;
 use std::ptr;
 use std::ffi::CString;
-use std::collections::VecDeque;
+use std::ffi::OsStr;
+use std::os::windows::ffi::OsStrExt;
+use std::sync::{
+    Arc,
+    Mutex
+};
 use std::sync::mpsc::Receiver;
 use libc;
 use {CreationError, Event, MouseCursor};
+use CursorState;
 
+use PixelFormat;
 use BuilderAttribs;
 
 pub use self::headless::HeadlessContext;
@@ -43,13 +51,21 @@ pub struct Window {
 
     /// True if a `Closed` event has been received.
     is_closed: AtomicBool,
+
+    /// The current cursor state.
+    cursor_state: Arc<Mutex<CursorState>>,
+
+    /// The pixel format that has been used to create this window.
+    pixel_format: PixelFormat,
 }
 
 unsafe impl Send for Window {}
 unsafe impl Sync for Window {}
 
 /// A simple wrapper that destroys the context when it is destroyed.
-struct ContextWrapper(pub winapi::HGLRC);
+// FIXME: remove `pub` (https://github.com/rust-lang/rust/issues/23585)
+#[doc(hidden)]
+pub struct ContextWrapper(pub winapi::HGLRC);
 
 impl Drop for ContextWrapper {
     fn drop(&mut self) {
@@ -60,7 +76,9 @@ impl Drop for ContextWrapper {
 }
 
 /// A simple wrapper that destroys the window when it is destroyed.
-struct WindowWrapper(pub winapi::HWND, pub winapi::HDC);
+// FIXME: remove `pub` (https://github.com/rust-lang/rust/issues/23585)
+#[doc(hidden)]
+pub struct WindowWrapper(pub winapi::HWND, pub winapi::HDC);
 
 impl Drop for WindowWrapper {
     fn drop(&mut self) {
@@ -97,10 +115,11 @@ impl Window {
     ///
     /// Calls SetWindowText on the HWND.
     pub fn set_title(&self, text: &str) {
+        let text = OsStr::new(text).encode_wide().chain(Some(0).into_iter())
+                                   .collect::<Vec<_>>();
+
         unsafe {
-            user32::SetWindowTextW(self.window.0,
-                text.utf16_units().chain(Some(0).into_iter())
-                .collect::<Vec<u16>>().as_ptr() as winapi::LPCWSTR);
+            user32::SetWindowTextW(self.window.0, text.as_ptr() as winapi::LPCWSTR);
         }
     }
 
@@ -144,7 +163,6 @@ impl Window {
 
     /// See the docs in the crate root file.
     pub fn get_inner_size(&self) -> Option<(u32, u32)> {
-        use std::mem;
         let mut rect: winapi::RECT = unsafe { mem::uninitialized() };
 
         if unsafe { user32::GetClientRect(self.window.0, &mut rect) } == 0 {
@@ -159,7 +177,6 @@ impl Window {
 
     /// See the docs in the crate root file.
     pub fn get_outer_size(&self) -> Option<(u32, u32)> {
-        use std::mem;
         let mut rect: winapi::RECT = unsafe { mem::uninitialized() };
 
         if unsafe { user32::GetWindowRect(self.window.0, &mut rect) } == 0 {
@@ -245,11 +262,80 @@ impl Window {
         ::Api::OpenGl
     }
 
+    pub fn get_pixel_format(&self) -> PixelFormat {
+        self.pixel_format.clone()
+    }
+
     pub fn set_window_resize_callback(&mut self, _: Option<fn(u32, u32)>) {
     }
 
     pub fn set_cursor(&self, _cursor: MouseCursor) {
         unimplemented!()
+    }
+
+    pub fn set_cursor_state(&self, state: CursorState) -> Result<(), String> {
+        let mut current_state = self.cursor_state.lock().unwrap();
+
+        let foreground_thread_id = unsafe { user32::GetWindowThreadProcessId(self.window.0, ptr::null_mut()) };
+        let current_thread_id = unsafe { kernel32::GetCurrentThreadId() };
+
+        unsafe { user32::AttachThreadInput(foreground_thread_id, current_thread_id, 1) };
+
+        let res = match (state, *current_state) {
+            (CursorState::Normal, CursorState::Normal) => Ok(()),
+            (CursorState::Hide, CursorState::Hide) => Ok(()),
+            (CursorState::Grab, CursorState::Grab) => Ok(()),
+
+            (CursorState::Hide, CursorState::Normal) => {
+                unsafe {
+                    user32::SetCursor(ptr::null_mut());
+                    *current_state = CursorState::Hide;
+                    Ok(())
+                }
+            },
+
+            (CursorState::Normal, CursorState::Hide) => {
+                unsafe {
+                    user32::SetCursor(user32::LoadCursorW(ptr::null_mut(), winapi::IDC_ARROW));
+                    *current_state = CursorState::Normal;
+                    Ok(())
+                }
+            },
+
+            (CursorState::Grab, CursorState::Normal) => {
+                unsafe {
+                    user32::SetCursor(ptr::null_mut());
+                    let mut rect = mem::uninitialized();
+                    if user32::GetClientRect(self.window.0, &mut rect) == 0 {
+                        return Err(format!("GetWindowRect failed"));
+                    }
+                    user32::ClientToScreen(self.window.0, mem::transmute(&mut rect.left));
+                    user32::ClientToScreen(self.window.0, mem::transmute(&mut rect.right));
+                    if user32::ClipCursor(&rect) == 0 {
+                        return Err(format!("ClipCursor failed"));
+                    }
+                    *current_state = CursorState::Grab;
+                    Ok(())
+                }
+            },
+
+            (CursorState::Normal, CursorState::Grab) => {
+                unsafe {
+                    user32::SetCursor(user32::LoadCursorW(ptr::null_mut(), winapi::IDC_ARROW));
+                    if user32::ClipCursor(ptr::null()) == 0 {
+                        return Err(format!("ClipCursor failed"));
+                    }
+                    *current_state = CursorState::Normal;
+                    Ok(())
+                }
+            },
+
+            _ => unimplemented!(),
+        };
+
+        unsafe { user32::AttachThreadInput(foreground_thread_id, current_thread_id, 0) };
+
+        res
     }
 
     pub fn hidpi_factor(&self) -> f32 {
@@ -320,7 +406,6 @@ impl<'a> Iterator for WaitEventsIterator<'a> {
     }
 }
 
-#[unsafe_destructor]
 impl Drop for Window {
     fn drop(&mut self) {
         unsafe {

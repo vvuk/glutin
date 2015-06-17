@@ -4,14 +4,17 @@ use std::default::Default;
 use Api;
 use BuilderAttribs;
 use CreationError;
+use CursorState;
 use Event;
 use GlRequest;
 use MouseCursor;
+use PixelFormat;
+use native_monitor::NativeMonitorId;
 
 use gl_common;
 use libc;
 
-use winimpl;
+use platform;
 
 /// Object that allows you to build windows.
 pub struct WindowBuilder<'a> {
@@ -57,13 +60,6 @@ impl<'a> WindowBuilder<'a> {
         self
     }
 
-    /// THIS FUNCTION IS DEPRECATED
-    #[deprecated = "Use with_gl instead"]
-    pub fn with_gl_version(mut self, version: (u32, u32)) -> WindowBuilder<'a> {
-        self.attribs.gl_version = GlRequest::Specific(::Api::OpenGl, (version.0 as u8, version.1 as u8));
-        self
-    }
-
     /// Sets how the backend should choose the OpenGL API and version.
     pub fn with_gl(mut self, request: GlRequest) -> WindowBuilder<'a> {
         self.attribs.gl_version = request;
@@ -72,7 +68,7 @@ impl<'a> WindowBuilder<'a> {
 
     /// Sets the *debug* flag for the OpenGL context.
     ///
-    /// The default value for this flag is `cfg!(ndebug)`, which means that it's enabled
+    /// The default value for this flag is `cfg!(debug_assertions)`, which means that it's enabled
     /// when you run `cargo build` and disabled when you run `cargo build --release`.
     pub fn with_gl_debug_flag(mut self, flag: bool) -> WindowBuilder<'a> {
         self.attribs.gl_debug = flag;
@@ -97,7 +93,6 @@ impl<'a> WindowBuilder<'a> {
     ///
     /// Will panic if `samples` is not a power of two.
     pub fn with_multisampling(mut self, samples: u16) -> WindowBuilder<'a> {
-        use std::num::UnsignedInt;
         assert!(samples.is_power_of_two());
         self.attribs.multisampling = Some(samples);
         self
@@ -128,6 +123,18 @@ impl<'a> WindowBuilder<'a> {
         self
     }
 
+    /// Sets whether sRGB should be enabled on the window. `None` means "I don't care".
+    pub fn with_srgb(mut self, srgb_enabled: Option<bool>) -> WindowBuilder<'a> {
+        self.attribs.srgb = srgb_enabled;
+        self
+    }
+
+    /// Sets the parent window
+    pub fn with_parent(mut self, parent: WindowID) -> WindowBuilder<'a> {
+        self.attribs.parent = parent;
+        self
+    }
+
     /// Builds the window.
     ///
     /// Error should be very rare and only occur in case of permission denied, incompatible system,
@@ -144,7 +151,7 @@ impl<'a> WindowBuilder<'a> {
         }
 
         // building
-        winimpl::Window::new(self.attribs).map(|w| Window { window: w })
+        platform::Window::new(self.attribs).map(|w| Window { window: w })
     }
 
     /// Builds the window.
@@ -181,7 +188,7 @@ impl<'a> WindowBuilder<'a> {
 /// }
 /// ```
 pub struct Window {
-    window: winimpl::Window,
+    window: platform::Window,
 }
 
 impl Default for Window {
@@ -207,13 +214,6 @@ impl Window {
     #[inline]
     pub fn is_closed(&self) -> bool {
         self.window.is_closed()
-    }
-
-    /// Returns true if the window has previously been closed by the user.
-    #[inline]
-    #[deprecated = "Use is_closed instead"]
-    pub fn should_close(&self) -> bool {
-        self.is_closed()
     }
 
     /// Modifies the title of the window.
@@ -249,7 +249,7 @@ impl Window {
     /// Returns the position of the top-left hand corner of the window relative to the
     ///  top-left hand corner of the desktop.
     ///
-    /// Note that the top-left hand corner of the desktop is not necessarly the same as
+    /// Note that the top-left hand corner of the desktop is not necessarily the same as
     ///  the screen. If the user uses a desktop with multiple monitors, the top-left hand corner
     ///  of the desktop is the top-left hand corner of the monitor at the top-left of the desktop.
     ///
@@ -381,6 +381,11 @@ impl Window {
         self.window.get_api()
     }
 
+    /// Returns the pixel format of this window.
+    pub fn get_pixel_format(&self) -> PixelFormat {
+        self.window.get_pixel_format()
+    }
+
     /// Create a window proxy for this window, that can be freely
     /// passed to different threads.
     #[inline]
@@ -414,6 +419,13 @@ impl Window {
     pub fn set_cursor_position(&self, x: i32, y: i32) -> Result<(), ()> {
         self.window.set_cursor_position(x, y)
     }
+
+    /// Sets how glutin handles the cursor. See the documentation of `CursorState` for details.
+    ///
+    /// Has no effect on Android.
+    pub fn set_cursor_state(&self, state: CursorState) -> Result<(), String> {
+        self.window.set_cursor_state(state)
+    }
 }
 
 impl gl_common::GlFunctionsSource for Window {
@@ -427,7 +439,7 @@ impl gl_common::GlFunctionsSource for Window {
 /// threads.
 #[derive(Clone)]
 pub struct WindowProxy {
-    proxy: winimpl::WindowProxy,
+    proxy: platform::WindowProxy,
 }
 
 impl WindowProxy {
@@ -441,22 +453,32 @@ impl WindowProxy {
     }
 }
 /// An iterator for the `poll_events` function.
-pub struct PollEventsIterator<'a>(winimpl::PollEventsIterator<'a>);
+pub struct PollEventsIterator<'a>(platform::PollEventsIterator<'a>);
 
 impl<'a> Iterator for PollEventsIterator<'a> {
     type Item = Event;
+
     fn next(&mut self) -> Option<Event> {
         self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 
 /// An iterator for the `wait_events` function.
-pub struct WaitEventsIterator<'a>(winimpl::WaitEventsIterator<'a>);
+pub struct WaitEventsIterator<'a>(platform::WaitEventsIterator<'a>);
 
 impl<'a> Iterator for WaitEventsIterator<'a> {
     type Item = Event;
+
     fn next(&mut self) -> Option<Event> {
         self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
 
@@ -464,29 +486,34 @@ impl<'a> Iterator for WaitEventsIterator<'a> {
 // Implementation note: we retreive the list once, then serve each element by one by one.
 // This may change in the future.
 pub struct AvailableMonitorsIter {
-    data: VecDequeIter<winimpl::MonitorID>,
+    data: VecDequeIter<platform::MonitorID>,
 }
 
 impl Iterator for AvailableMonitorsIter {
     type Item = MonitorID;
+
     fn next(&mut self) -> Option<MonitorID> {
         self.data.next().map(|id| MonitorID(id))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.data.size_hint()
     }
 }
 
 /// Returns the list of all available monitors.
 pub fn get_available_monitors() -> AvailableMonitorsIter {
-    let data = winimpl::get_available_monitors();
+    let data = platform::get_available_monitors();
     AvailableMonitorsIter{ data: data.into_iter() }
 }
 
 /// Returns the primary monitor of the system.
 pub fn get_primary_monitor() -> MonitorID {
-    MonitorID(winimpl::get_primary_monitor())
+    MonitorID(platform::get_primary_monitor())
 }
 
 /// Identifier for a monitor.
-pub struct MonitorID(winimpl::MonitorID);
+pub struct MonitorID(platform::MonitorID);
 
 impl MonitorID {
     /// Returns a human-readable name of the monitor.
@@ -495,9 +522,19 @@ impl MonitorID {
         id.get_name()
     }
 
+    /// Returns the native platform identifier for this monitor.
+    pub fn get_native_identifier(&self) -> NativeMonitorId {
+        let &MonitorID(ref id) = self;
+        id.get_native_identifier()
+    }
+
     /// Returns the number of pixels currently displayed on the monitor.
     pub fn get_dimensions(&self) -> (u32, u32) {
         let &MonitorID(ref id) = self;
         id.get_dimensions()
     }
 }
+
+
+/// Identifier for a display system window.
+pub type WindowID = *mut libc::c_void;

@@ -1,9 +1,8 @@
 [package]
-
 name = "glutin"
-version = "0.0.7"
+version = "0.0.26"
 authors = ["tomaka <pierre.krieger1708@gmail.com>"]
-description = "Cross-plaform OpenGL context provider. Important: the crates.io only supports Windows and Linux for the moment."
+description = "Cross-plaform OpenGL context provider."
 keywords = ["windowing", "opengl"]
 license = "Apache-2.0"
 readme = "README.md"
@@ -18,6 +17,7 @@ headless = []
 
 [dependencies]
 gl_common = "*"
+lazy_static = "0.1"
 libc = "*"
 
 [build-dependencies]
@@ -28,34 +28,36 @@ khronos_api = "*"
 clock_ticks = "*"
 
 [target.arm-linux-androideabi.dependencies.android_glue]
-git = "https://github.com/tomaka/android-rs-glue"
+version = "0"
 
-[target.i686-apple-darwin.dependencies.cocoa]
-git = "https://github.com/servo/rust-cocoa"
-
-[target.x86_64-apple-darwin.dependencies.cocoa]
-git = "https://github.com/servo/rust-cocoa"
-
-[target.i686-apple-darwin.dependencies.core_graphics]
-git = "https://github.com/servo/rust-core-graphics"
-
-[target.x86_64-apple-darwin.dependencies.core_graphics]
-git = "https://github.com/servo/rust-core-graphics"
-
-[target.i686-apple-darwin.dependencies.core_foundation]
-git = "https://github.com/servo/rust-core-foundation"
-
-[target.x86_64-apple-darwin.dependencies.core_foundation]
-git = "https://github.com/servo/rust-core-foundation"
+[target.x86_64-apple-darwin.dependencies]
+objc = "0.1"
+cocoa = "0"
+core-foundation = "0"
+core-graphics = "0"
 
 [target.i686-pc-windows-gnu.dependencies]
 winapi = "0.1"
-gdi32-sys = "*"
-user32-sys = "*"
-kernel32-sys = "*"
+gdi32-sys = "0.1"
+user32-sys = "0.1"
+kernel32-sys = "0.1"
 
 [target.x86_64-pc-windows-gnu.dependencies]
 winapi = "0.1"
-gdi32-sys = "*"
-user32-sys = "*"
-kernel32-sys = "*"
+gdi32-sys = "0.1"
+user32-sys = "0.1"
+kernel32-sys = "0.1"
+
+[target.i686-unknown-linux-gnu.dependencies]
+osmesa-sys = "*"
+
+[target.x86_64-unknown-linux-gnu.dependencies]
+osmesa-sys = "*"
+
+[target.i686-unknown-linux-gnu.dependencies.x11]
+version = "*"
+features = ["xlib", "xf86vmode", "xcursor"]
+
+[target.x86_64-unknown-linux-gnu.dependencies.x11]
+version = "*"
+features = ["xlib", "xf86vmode", "xcursor"]
