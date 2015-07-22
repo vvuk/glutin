@@ -546,8 +546,8 @@ impl Window {
         unsafe {
             with_c_str(&*builder.title, |c_name| {
                 let hint = ffi::XAllocClassHint();
-                (*hint).res_name = c_name as *mut i8;
-                (*hint).res_class = c_name as *mut i8;
+                (*hint).res_name = c_name as *mut ::libc::c_char;
+                (*hint).res_class = c_name as *mut ::libc::c_char;
                 ffi::XSetClassHint(display, window, hint);
                 ffi::XFree(hint as *mut libc::c_void);
             });
