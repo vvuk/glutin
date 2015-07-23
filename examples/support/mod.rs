@@ -1,5 +1,9 @@
 #![cfg(feature = "window")]
 
+#[cfg(target_os = "linux")]
+#[link(name = "GL")]
+extern {}
+
 use std::ffi::CStr;
 use glutin;
 
