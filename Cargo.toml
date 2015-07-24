@@ -54,10 +54,17 @@ osmesa-sys = "*"
 [target.x86_64-unknown-linux-gnu.dependencies]
 osmesa-sys = "*"
 
+[target.aarch64-unknown-linux-gnu.dependencies]
+osmesa-sys = "*"
+
 [target.i686-unknown-linux-gnu.dependencies.x11]
 version = "*"
 features = ["xlib", "xf86vmode", "xcursor"]
 
 [target.x86_64-unknown-linux-gnu.dependencies.x11]
+version = "*"
+features = ["xlib", "xf86vmode", "xcursor"]
+
+[target.aarch64-unknown-linux-gnu.dependencies.x11]
 version = "*"
 features = ["xlib", "xf86vmode", "xcursor"]
