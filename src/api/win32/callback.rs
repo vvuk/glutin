@@ -88,6 +88,18 @@ pub unsafe extern "system" fn callback(window: winapi::HWND, msg: winapi::UINT,
             1
         },
 
+        winapi::WM_PAINT => {
+            use events::Event::Refresh;
+            // We could use ::GetUpdateRgn to get detailed info
+            // about what needs to be updated; but he Refresh event
+            // doesn't pass that long anywhere.
+            let mut ps : winapi::PAINTSTRUCT = mem::uninitialized();
+            let paintdc = user32::BeginPaint(window, mem::transmute(&mut ps));
+            send_event(window, Refresh);
+            user32::EndPaint(window, &ps);
+            0
+        },
+
         winapi::WM_SIZE => {
             use events::Event::Resized;
             let w = winapi::LOWORD(lparam as winapi::DWORD) as u32;
